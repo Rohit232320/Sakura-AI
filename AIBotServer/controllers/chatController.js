@@ -1,11 +1,19 @@
 import axios from "axios";
+import OpenAI from "openai";
 import { UserContext } from "../models/AiBotDbSchema.js";
 
 /* =======================
-   RATE LIMITING (CRITICAL)
+   OPENAI CLIENT
+======================= */
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+/* =======================
+   RATE LIMITING
 ======================= */
 const userCooldown = new Map();
-const COOLDOWN_MS = 6000; // 6 seconds
+const COOLDOWN_MS = 6000;
 
 /* =======================
    MAIN CONTROLLER
@@ -42,14 +50,14 @@ export const chatController = async (req, res) => {
        LAST 2 MESSAGES ONLY
     ======================= */
     const recentHistory = history.slice(-2);
-
     let historyPrompt = "";
+
     for (const conv of recentHistory) {
       historyPrompt += `${effectiveUserName}: ${conv.message}\nYou: ${conv.response}\n`;
     }
 
     /* =======================
-       SHORT PERSONA (TOKEN SAFE)
+       PERSONA
     ======================= */
     const persona = `
 You are Sakura.
@@ -62,9 +70,6 @@ Rules:
 - No emojis
 `;
 
-    /* =======================
-       FINAL PROMPT
-    ======================= */
     const finalPrompt = `
 ${persona}
 
@@ -76,23 +81,61 @@ Sakura:
 `;
 
     /* =======================
-       GEMINI API CALL (ONCE)
+       TRY GEMINI FIRST
     ======================= */
-    const response = await axios.post(
-      `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            parts: [{ text: finalPrompt }]
-          }
-        ]
-      }
-    );
+    let botResponse;
 
-    let botResponse =
-      response.data?.candidates?.[0]?.content?.parts
-        ?.map(p => p.text)
-        .join(" ") || "Hmm.";
+    try {
+      const geminiResponse = await axios.post(
+        `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [
+            {
+              parts: [{ text: finalPrompt }]
+            }
+          ]
+        }
+      );
+
+      botResponse =
+        geminiResponse.data?.candidates?.[0]?.content?.parts
+          ?.map(p => p.text)
+          .join(" ");
+
+    } catch (err) {
+      /* =======================
+         GEMINI FAILED → OPENAI
+      ======================= */
+      if (err.response?.status === 429) {
+        console.warn("Gemini rate limit hit → falling back to OpenAI");
+      } else {
+        console.warn("Gemini error → falling back to OpenAI");
+      }
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: persona
+          },
+          {
+            role: "user",
+            content: `
+Conversation:
+${historyPrompt}
+
+${effectiveUserName}: ${message}
+`
+          }
+        ],
+        max_tokens: 150
+      });
+
+      botResponse = completion.choices[0].message.content;
+    }
+
+    if (!botResponse) botResponse = "Hmm.";
 
     /* =======================
        SAVE CONTEXT
@@ -115,7 +158,7 @@ Sakura:
       { upsert: true }
     );
 
-    /* ---- Trim history to last 20 ---- */
+    /* ---- Trim history ---- */
     await UserContext.updateOne(
       { userId },
       { $push: { conversationHistory: { $each: [], $slice: -20 } } }
@@ -124,16 +167,6 @@ Sakura:
     return res.json({ message: botResponse });
 
   } catch (err) {
-    /* =======================
-       HARD STOP ON RATE LIMIT
-    ======================= */
-    if (err.response?.status === 429) {
-      console.error("Gemini rate limit hit");
-      return res.status(429).json({
-        message: "I'm tired rn 😴 try again later"
-      });
-    }
-
     console.error("Chat error:", err.message);
     return res.status(500).json({
       error: "Failed to process chat"
