@@ -9,6 +9,8 @@ COPY package*.json ./
 
 # Install dependencies
 RUN npm install
+RUN npm install openai
+
 
 # Copy the rest of the application
 COPY . .
@@ -17,4 +19,5 @@ COPY . .
 EXPOSE 7860
 
 # Start the app
+
 CMD ["npm", "start"]
