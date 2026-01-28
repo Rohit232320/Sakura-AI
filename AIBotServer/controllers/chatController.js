@@ -9,7 +9,7 @@ const conversationVectorSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   message: { type: String, required: true },
   response: { type: String, required: true },
-  embedding: { type: [Number], required: true }, // 384 dimensions for HuggingFace model
+  embedding: { type: [Number], required: true },
   timestamp: { type: Date, default: Date.now },
   conversationId: { type: Number, required: true }
 });
@@ -19,18 +19,16 @@ conversationVectorSchema.index({ userId: 1, timestamp: -1 });
 const ConversationVector = mongoose.model('ConversationVector', conversationVectorSchema);
 
 // ===============================
-// FREE EMBEDDING - HUGGINGFACE ONLY
+// FREE EMBEDDING - MULTIPLE FALLBACKS
 // ===============================
+
 /**
- * HuggingFace Free Inference API
- * Model: sentence-transformers/all-MiniLM-L6-v2
- * NO API KEY NEEDED! (but optional token gives better rate limits)
- * Rate Limit: 1000 req/hour without token, 3000 req/hour with token
+ * Option 1: HuggingFace Sentence Transformers (NEW ENDPOINT)
  */
-async function generateEmbedding(text) {
+async function generateEmbeddingHF(text) {
   try {
     const response = await axios.post(
-      'https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2',
+      'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2',
       { inputs: text.substring(0, 500) },
       { 
         headers: { 
@@ -43,37 +41,81 @@ async function generateEmbedding(text) {
       }
     );
     
-    return response.data; // 384-dimensional array
+    // Response is nested array, flatten it
+    return Array.isArray(response.data[0]) ? response.data[0] : response.data;
   } catch (err) {
-    // If model is loading, retry once
-    if (err.response?.data?.error?.includes('loading')) {
-      console.log('Model loading, retrying in 2s...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      try {
-        const response = await axios.post(
-          'https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2',
-          { inputs: text.substring(0, 500) },
-          { 
-            headers: { 
-              'Content-Type': 'application/json',
-              ...(process.env.HUGGINGFACE_TOKEN && {
-                'Authorization': `Bearer ${process.env.HUGGINGFACE_TOKEN}`
-              })
-            },
-            timeout: 10000 
-          }
-        );
-        return response.data;
-      } catch (retryErr) {
-        console.error("HF Embedding retry failed:", retryErr.message);
-        return null;
-      }
-    }
-    
-    console.error("HF Embedding error:", err.message);
+    console.warn("HF method 1 failed:", err.message);
     return null;
   }
+}
+
+/**
+ * Option 2: Xenova/transformers.js embeddings (Fallback)
+ */
+async function generateEmbeddingXenova(text) {
+  try {
+    const response = await axios.post(
+      'https://api-inference.huggingface.co/models/Xenova/all-MiniLM-L6-v2',
+      { inputs: text.substring(0, 500) },
+      { 
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(process.env.HUGGINGFACE_TOKEN && {
+            'Authorization': `Bearer ${process.env.HUGGINGFACE_TOKEN}`
+          })
+        },
+        timeout: 10000 
+      }
+    );
+    
+    return Array.isArray(response.data[0]) ? response.data[0] : response.data;
+  } catch (err) {
+    console.warn("Xenova method failed:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Option 3: Use Gemini for embeddings (Free alternative)
+ */
+async function generateEmbeddingGemini(text) {
+  try {
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        model: "models/text-embedding-004",
+        content: {
+          parts: [{ text: text.substring(0, 500) }]
+        }
+      },
+      { timeout: 10000 }
+    );
+    
+    return response.data.embedding.values;
+  } catch (err) {
+    console.warn("Gemini embedding failed:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Main embedding function with multiple fallbacks
+ */
+async function generateEmbedding(text) {
+  // Try HuggingFace first (fastest)
+  let embedding = await generateEmbeddingHF(text);
+  if (embedding) return embedding;
+  
+  // Try Xenova model
+  embedding = await generateEmbeddingXenova(text);
+  if (embedding) return embedding;
+  
+  // Try Gemini embeddings (free, reliable)
+  embedding = await generateEmbeddingGemini(text);
+  if (embedding) return embedding;
+  
+  console.error("All embedding methods failed");
+  return null;
 }
 
 // ===============================
@@ -146,7 +188,7 @@ async function storeConversationVector(userId, message, response, conversationId
     const embedding = await generateEmbedding(combinedText);
     
     if (!embedding) {
-      console.warn("Skipping vector storage - embedding generation failed");
+      console.warn("Skipping vector storage - all embedding methods failed");
       return;
     }
 
@@ -175,6 +217,13 @@ async function retrieveRelevantContext(userId, message, topK = 2) {
     
     if (!queryEmbedding) {
       console.warn("Could not generate query embedding, using fallback");
+      return [];
+    }
+
+    // Check if vector index exists first
+    const collections = await mongoose.connection.db.listCollections({ name: 'conversationvectors' }).toArray();
+    if (collections.length === 0) {
+      console.warn("ConversationVector collection doesn't exist yet");
       return [];
     }
 
@@ -207,7 +256,12 @@ async function retrieveRelevantContext(userId, message, topK = 2) {
     }));
     
   } catch (err) {
-    console.error("Vector search error:", err.message);
+    // If vector search fails (index not created), silently fall back
+    if (err.message?.includes('vector_index') || err.message?.includes('$vectorSearch')) {
+      console.warn("Vector search not available yet - index may not be created. Using MongoDB only.");
+    } else {
+      console.error("Vector search error:", err.message);
+    }
     return [];
   }
 }
