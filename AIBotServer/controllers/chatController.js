@@ -1,175 +1,285 @@
-import axios from "axios";
-import OpenAI from "openai";
-import { UserContext } from "../models/AiBotDbSchema.js";
+import axios from 'axios';
+import mongoose from 'mongoose';
+import { UserContext, GlobalContext } from '../models/AiBotDbSchema.js';
+import natural from 'natural'; 
 
-/* =======================
-   OPENAI CLIENT
-======================= */
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+// ===============================
+// NLP SETUP
+// ===============================
+const tokenizer = new natural.WordTokenizer();
+const stemmer = natural.PorterStemmer;
+const TfIdf = natural.TfIdf;
 
-/* =======================
-   RATE LIMITING
-======================= */
-const userCooldown = new Map();
-const COOLDOWN_MS = 6000;
-
-/* =======================
-   MAIN CONTROLLER
-======================= */
-export const chatController = async (req, res) => {
-  const { message, userName } = req.body;
-  const userId = req.params.userId;
-
-  if (!message) {
-    return res.status(400).json({ error: "Message required" });
-  }
-
-  /* ---- Cooldown ---- */
-  const now = Date.now();
-  const lastCall = userCooldown.get(userId) || 0;
-  if (now - lastCall < COOLDOWN_MS) {
-    return res.json({ message: "Slow down 😏" });
-  }
-  userCooldown.set(userId, now);
-
+// ===============================
+// 1. GROQ HELPER (PRIMARY - FASTEST)
+// ===============================
+async function callGroq(systemPrompt, userMessage) {
   try {
-    /* =======================
-       LOAD USER CONTEXT
-    ======================= */
+    const res = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: "llama-3.1-8b-instant", // High speed, high limits (14k/day)
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage }
+        ],
+        temperature: 0.7,
+        max_tokens: 150, // Strict limit to save cost/latency
+      },
+      {
+        headers: { 
+          "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 10000 // 10s timeout is plenty for Groq
+      }
+    );
+
+    return res.data.choices[0]?.message?.content || null;
+  } catch (err) {
+    console.warn("Groq Error:", err.response?.data?.error?.message || err.message);
+    return null;
+  }
+}
+
+// ===============================
+// 2. GEMINI HELPER (FALLBACK)
+// ===============================
+async function callGemini(fullPrompt) {
+  try {
+    // Ensure GEMINI_API_URL in .env points to gemini-2.5-flash-lite for best limits
+    const apiUrl = process.env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent";
+    
+    const res = await axios.post(
+      `${apiUrl}?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ parts: [{ text: fullPrompt }] }],
+        generationConfig: {
+          maxOutputTokens: 150, // Limit output tokens
+          temperature: 0.7
+        }
+      },
+      { timeout: 15000 }
+    );
+
+    return res.data.candidates[0].content.parts.map(p => p.text).join(" ");
+  } catch (err) {
+    console.error("Gemini Error:", err.response?.data?.error?.message || err.message);
+    return null;
+  }
+}
+
+/**
+ * ===============================
+ * CONTEXT RETRIEVAL (OPTIMIZED RAG)
+ * ===============================
+ */
+async function retrieveUserContext(userId, message) {
+  try {
     const userContext = await UserContext.findOne({ userId }).lean();
-    const history = userContext?.conversationHistory || [];
 
-    const effectiveUserName =
-      userName ||
-      userContext?.username ||
-      "User";
-
-    /* =======================
-       LAST 2 MESSAGES ONLY
-    ======================= */
-    const recentHistory = history.slice(-2);
-    let historyPrompt = "";
-
-    for (const conv of recentHistory) {
-      historyPrompt += `${effectiveUserName}: ${conv.message}\nYou: ${conv.response}\n`;
+    if (!userContext) {
+      return {
+        userInfo: { userId, mood: "neutral" },
+        relevantHistory: [],
+        recentHistory: [],
+        botPersonality: "sassy AI",
+        previousBotMessage: null
+      };
     }
 
-    /* =======================
-       PERSONA
-    ======================= */
-    const persona = `
-You are Sakura.
-Personality: playful, flirty, sassy, human-like.
-Rules:
-- Short replies (1–3 sentences)
-- Never mention being an AI
-- Match user's tone (English / Hinglish)
-- Remember recent messages
-- No emojis
-`;
+    const globalContext = await GlobalContext.findOne({}).lean();
+    const botPersonality = globalContext?.botPersonality || "toxic, sassy, and slightly unhinged girlfriend AI";
 
-    const finalPrompt = `
-${persona}
+    const conversationHistory = userContext.conversationHistory || [];
+    const previousBotMessage = conversationHistory.length > 0
+        ? conversationHistory[conversationHistory.length - 1].response
+        : null;
 
-Conversation:
-${historyPrompt}
+    // OPTIMIZATION: Reduce recent history from 5 to 3 to save tokens
+    const recentHistory = conversationHistory.slice(-3);
 
-${effectiveUserName}: ${message}
-Sakura:
-`;
+    let relevantHistory = [];
+    if (conversationHistory.length > 0) {
+      const tfidf = new TfIdf();
+      tfidf.addDocument(preprocessText(message));
 
-    /* =======================
-       TRY GEMINI FIRST
-    ======================= */
-    let botResponse;
-
-    try {
-      const geminiResponse = await axios.post(
-        `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [
-            {
-              parts: [{ text: finalPrompt }]
-            }
-          ]
+      const map = new Map();
+      conversationHistory.forEach((conv, idx) => {
+        // Only index if message is substantial
+        if(conv.message && conv.message.length > 5) {
+            const combined = preprocessText(`${conv.message} ${conv.response || ''}`);
+            tfidf.addDocument(combined);
+            map.set(idx + 1, conv);
         }
-      );
-
-      botResponse =
-        geminiResponse.data?.candidates?.[0]?.content?.parts
-          ?.map(p => p.text)
-          .join(" ");
-
-    } catch (err) {
-      /* =======================
-         GEMINI FAILED → OPENAI
-      ======================= */
-      if (err.response?.status === 429) {
-        console.warn("Gemini rate limit hit → falling back to OpenAI");
-      } else {
-        console.warn("Gemini error → falling back to OpenAI");
-      }
-
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: persona
-          },
-          {
-            role: "user",
-            content: `
-Conversation:
-${historyPrompt}
-
-${effectiveUserName}: ${message}
-`
-          }
-        ],
-        max_tokens: 150
       });
 
-      botResponse = completion.choices[0].message.content;
+      const scored = [];
+      tfidf.tfidfs(preprocessText(message), (i, score) => {
+        if (i > 0) scored.push({ conv: map.get(i), score });
+      });
+
+      // OPTIMIZATION: Reduce relevant history from 8 to 2 items
+      // We only want the absolutely most relevant past conversations
+      relevantHistory = scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 2) 
+        .map(v => v.conv);
     }
 
-    if (!botResponse) botResponse = "Hmm.";
+    return {
+      userInfo: {
+        userId,
+        username: userContext.username || "User",
+      },
+      relevantHistory,
+      recentHistory,
+      botPersonality,
+      previousBotMessage
+    };
 
-    /* =======================
-       SAVE CONTEXT
-    ======================= */
+  } catch (err) {
+    console.error("retrieveUserContext error:", err);
+    return {
+      userInfo: { userId, username: "User" },
+      relevantHistory: [],
+      recentHistory: [],
+      botPersonality: "friendly",
+      previousBotMessage: null
+    };
+  }
+}
+
+/**
+ * ===============================
+ * CONTEXT UPDATE
+ * ===============================
+ */
+async function updateUserContext(userId, username, message, response) {
+  try {
     await UserContext.findOneAndUpdate(
       { userId },
       {
-        $set: {
-          username: effectiveUserName,
-          lastActive: new Date()
-        },
+        $set: { username, lastActive: new Date() },
         $push: {
           conversationHistory: {
             message,
-            response: botResponse,
+            response,
             timestamp: new Date()
           }
         }
       },
       { upsert: true }
     );
+  } catch (e) {
+    console.error("Context update failed", e);
+  }
+}
 
-    /* ---- Trim history ---- */
-    await UserContext.updateOne(
-      { userId },
-      { $push: { conversationHistory: { $each: [], $slice: -20 } } }
+/**
+ * ===============================
+ * UTILITIES
+ * ===============================
+ */
+function preprocessText(text) {
+  if (!text) return '';
+  return tokenizer
+    .tokenize(text.toLowerCase())
+    .filter(t => t.length > 2)
+    .map(t => stemmer.stem(t))
+    .join(' ');
+}
+
+function removeAllEmojisAndEmoticons(text) {
+  return text.replace(/[\u{1F600}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+}
+
+/**
+ * ===============================
+ * MAIN CONTROLLER
+ * ===============================
+ */
+export const chatController = async (req, res) => {
+  const { message, userName } = req.body;
+  const userId = req.params.userId;
+
+  try {
+    // 1. Get Context (Reduced Size)
+    const {
+      userInfo,
+      relevantHistory,
+      recentHistory,
+      botPersonality,
+      previousBotMessage
+    } = await retrieveUserContext(userId, message);
+
+    const effectiveUserName = userName || userInfo.username || "User";
+
+    // 2. Build Persona (System Prompt)
+    const persona = `You are Sakura AI, a ${botPersonality}.
+- Reply in 1-2 sentences maximum.
+- Never mention being an AI.
+- Use Hinglish if the user does.
+- No emojis.
+${previousBotMessage ? `Your previous reply was: "${previousBotMessage}"` : ""}`;
+
+    // 3. Build Conversation Context
+    // Combining relevant (old but similar) + recent (chronological)
+    // We filter duplicates roughly by checking timestamps or content logic if needed, 
+    // but for now simple concatenation with Set is fine or just relying on their distinct nature.
+    const contextItems = [...relevantHistory, ...recentHistory];
+    
+    // Create a clean text block for context
+    const contextString = contextItems.map(c => 
+      `${effectiveUserName}: ${c.message}\nYou: ${c.response}`
+    ).join('\n');
+
+    const finalUserPrompt = `
+CONTEXT:
+${contextString}
+
+CURRENT CHAT:
+${effectiveUserName}: ${message}
+Sakura AI:`;
+
+    let botResponse = null;
+
+    // ===============================
+    // ATTEMPT 1: GROQ (Primary)
+    // ===============================
+    botResponse = await callGroq(persona, finalUserPrompt);
+
+    // ===============================
+    // ATTEMPT 2: GEMINI (Fallback)
+    // ===============================
+    if (!botResponse) {
+      console.warn("⚠️ Groq failed or returned empty. Switching to Gemini...");
+      const fullGeminiPrompt = `${persona}\n${finalUserPrompt}`;
+      botResponse = await callGemini(fullGeminiPrompt);
+    }
+
+    // ===============================
+    // FINAL FALLBACK
+    // ===============================
+    if (!botResponse) {
+        botResponse = "Hmm.";
+    }
+
+    // Clean up
+    botResponse = removeAllEmojisAndEmoticons(botResponse);
+
+    // Save
+    await updateUserContext(
+      userId,
+      effectiveUserName,
+      message,
+      botResponse
     );
 
-    return res.json({ message: botResponse });
+    res.json({ message: botResponse });
 
   } catch (err) {
-    console.error("Chat error:", err.message);
-    return res.status(500).json({
-      error: "Failed to process chat"
-    });
+    console.error("chatController critical failure:", err);
+    res.status(500).json({ error: "Chat failed" });
   }
 };
