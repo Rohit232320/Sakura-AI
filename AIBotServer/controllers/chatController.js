@@ -102,8 +102,10 @@ async function retrieveUserContext(userId, message) {
       ? conversationHistory[conversationHistory.length - 1].response
       : null;
 
-    // Get last 2 messages for recency
-    const recentHistory = conversationHistory.slice(-2);
+    // Get last 2 messages for recency - FILTER OUT NULLS
+    const recentHistory = conversationHistory
+      .slice(-2)
+      .filter(conv => conv && conv.message && conv.response);
 
     // TF-IDF for relevant history
     let relevantHistory = [];
@@ -113,7 +115,8 @@ async function retrieveUserContext(userId, message) {
 
       const map = new Map();
       conversationHistory.forEach((conv, idx) => {
-        if(conv.message && conv.message.length > 5) {
+        // NULL CHECK HERE
+        if(conv && conv.message && conv.message.length > 5) {
           const combined = preprocessText(`${conv.message} ${conv.response || ''}`);
           tfidf.addDocument(combined);
           map.set(idx + 1, conv);
@@ -122,13 +125,16 @@ async function retrieveUserContext(userId, message) {
 
       const scored = [];
       tfidf.tfidfs(preprocessText(message), (i, score) => {
-        if (i > 0) scored.push({ conv: map.get(i), score });
+        if (i > 0 && map.has(i)) {
+          scored.push({ conv: map.get(i), score });
+        }
       });
 
       relevantHistory = scored
         .sort((a, b) => b.score - a.score)
         .slice(0, 2)
-        .map(v => v.conv);
+        .map(v => v.conv)
+        .filter(conv => conv && conv.message && conv.response); // FILTER NULLS
     }
 
     return {
@@ -210,9 +216,9 @@ export const chatController = async (req, res) => {
   try {
     // Validate request body
     if (!req.body) {
-      console.error("Request body is undefined - middleware issue");
+      console.error("Request body is undefined");
       return res.status(400).json({ 
-        error: "Request body is missing. Server configuration issue." 
+        error: "Request body is missing" 
       });
     }
 
@@ -221,12 +227,12 @@ export const chatController = async (req, res) => {
 
     // Validate required fields
     if (!message) {
-      console.error("Message is missing from request body");
+      console.error("Message is missing from request");
       return res.status(400).json({ error: "Message is required" });
     }
 
     if (!userId) {
-      console.error("UserId is missing from URL params");
+      console.error("UserId is missing");
       return res.status(400).json({ error: "UserId is required" });
     }
 
@@ -244,14 +250,16 @@ export const chatController = async (req, res) => {
 Rules: 1-2 sentences max. Never mention being AI. Use Hinglish if user does. No emojis.
 ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
 
-    // Combine relevant + recent context
+    // Combine relevant + recent context with NULL SAFETY
     const seenMessages = new Set();
-    const allContext = [...relevantHistory, ...recentHistory].filter(c => {
-      const key = c.message?.substring(0, 50);
-      if (seenMessages.has(key)) return false;
-      seenMessages.add(key);
-      return true;
-    });
+    const allContext = [...relevantHistory, ...recentHistory]
+      .filter(c => c && c.message && c.response) // NULL CHECK FIRST!
+      .filter(c => {
+        const key = c.message.substring(0, 50);
+        if (seenMessages.has(key)) return false;
+        seenMessages.add(key);
+        return true;
+      });
 
     const contextString = allContext
       .slice(-4)
@@ -285,6 +293,7 @@ ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
 
   } catch (err) {
     console.error("chatController critical failure:", err);
+    console.error("Error stack:", err.stack);
     res.status(500).json({ 
       error: "Chat failed",
       details: err.message 
