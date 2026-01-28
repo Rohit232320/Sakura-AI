@@ -1,122 +1,14 @@
 import axios from 'axios';
 import mongoose from 'mongoose';
 import { UserContext, GlobalContext } from '../models/AiBotDbSchema.js';
+import natural from 'natural';
 
 // ===============================
-// MONGODB ATLAS VECTOR SEARCH SCHEMA
+// NLP SETUP (FALLBACK)
 // ===============================
-const conversationVectorSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  message: { type: String, required: true },
-  response: { type: String, required: true },
-  embedding: { type: [Number], required: true },
-  timestamp: { type: Date, default: Date.now },
-  conversationId: { type: Number, required: true }
-});
-
-conversationVectorSchema.index({ userId: 1, timestamp: -1 });
-
-const ConversationVector = mongoose.model('ConversationVector', conversationVectorSchema);
-
-// ===============================
-// FREE EMBEDDING - MULTIPLE FALLBACKS
-// ===============================
-
-/**
- * Option 1: HuggingFace Sentence Transformers (NEW ENDPOINT)
- */
-async function generateEmbeddingHF(text) {
-  try {
-    const response = await axios.post(
-      'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2',
-      { inputs: text.substring(0, 500) },
-      { 
-        headers: { 
-          'Content-Type': 'application/json',
-          ...(process.env.HUGGINGFACE_TOKEN && {
-            'Authorization': `Bearer ${process.env.HUGGINGFACE_TOKEN}`
-          })
-        },
-        timeout: 10000 
-      }
-    );
-    
-    // Response is nested array, flatten it
-    return Array.isArray(response.data[0]) ? response.data[0] : response.data;
-  } catch (err) {
-    console.warn("HF method 1 failed:", err.message);
-    return null;
-  }
-}
-
-/**
- * Option 2: Xenova/transformers.js embeddings (Fallback)
- */
-async function generateEmbeddingXenova(text) {
-  try {
-    const response = await axios.post(
-      'https://api-inference.huggingface.co/models/Xenova/all-MiniLM-L6-v2',
-      { inputs: text.substring(0, 500) },
-      { 
-        headers: { 
-          'Content-Type': 'application/json',
-          ...(process.env.HUGGINGFACE_TOKEN && {
-            'Authorization': `Bearer ${process.env.HUGGINGFACE_TOKEN}`
-          })
-        },
-        timeout: 10000 
-      }
-    );
-    
-    return Array.isArray(response.data[0]) ? response.data[0] : response.data;
-  } catch (err) {
-    console.warn("Xenova method failed:", err.message);
-    return null;
-  }
-}
-
-/**
- * Option 3: Use Gemini for embeddings (Free alternative)
- */
-async function generateEmbeddingGemini(text) {
-  try {
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        model: "models/text-embedding-004",
-        content: {
-          parts: [{ text: text.substring(0, 500) }]
-        }
-      },
-      { timeout: 10000 }
-    );
-    
-    return response.data.embedding.values;
-  } catch (err) {
-    console.warn("Gemini embedding failed:", err.message);
-    return null;
-  }
-}
-
-/**
- * Main embedding function with multiple fallbacks
- */
-async function generateEmbedding(text) {
-  // Try HuggingFace first (fastest)
-  let embedding = await generateEmbeddingHF(text);
-  if (embedding) return embedding;
-  
-  // Try Xenova model
-  embedding = await generateEmbeddingXenova(text);
-  if (embedding) return embedding;
-  
-  // Try Gemini embeddings (free, reliable)
-  embedding = await generateEmbeddingGemini(text);
-  if (embedding) return embedding;
-  
-  console.error("All embedding methods failed");
-  return null;
-}
+const tokenizer = new natural.WordTokenizer();
+const stemmer = natural.PorterStemmer;
+const TfIdf = natural.TfIdf;
 
 // ===============================
 // GROQ HELPER (FREE)
@@ -151,7 +43,7 @@ async function callGroq(systemPrompt, userMessage) {
 }
 
 // ===============================
-// GEMINI HELPER (FALLBACK - FREE)
+// GEMINI HELPER (FALLBACK)
 // ===============================
 async function callGemini(fullPrompt) {
   try {
@@ -179,96 +71,7 @@ async function callGemini(fullPrompt) {
 
 /**
  * ===============================
- * STORE IN MONGODB VECTOR COLLECTION
- * ===============================
- */
-async function storeConversationVector(userId, message, response, conversationId) {
-  try {
-    const combinedText = `User: ${message}\nBot: ${response}`;
-    const embedding = await generateEmbedding(combinedText);
-    
-    if (!embedding) {
-      console.warn("Skipping vector storage - all embedding methods failed");
-      return;
-    }
-
-    await ConversationVector.create({
-      userId,
-      message,
-      response,
-      embedding,
-      conversationId,
-      timestamp: new Date()
-    });
-    
-  } catch (err) {
-    console.error("Vector storage error:", err.message);
-  }
-}
-
-/**
- * ===============================
- * MONGODB ATLAS VECTOR SEARCH
- * ===============================
- */
-async function retrieveRelevantContext(userId, message, topK = 2) {
-  try {
-    const queryEmbedding = await generateEmbedding(message);
-    
-    if (!queryEmbedding) {
-      console.warn("Could not generate query embedding, using fallback");
-      return [];
-    }
-
-    // Check if vector index exists first
-    const collections = await mongoose.connection.db.listCollections({ name: 'conversationvectors' }).toArray();
-    if (collections.length === 0) {
-      console.warn("ConversationVector collection doesn't exist yet");
-      return [];
-    }
-
-    // MongoDB Atlas Vector Search
-    const results = await ConversationVector.aggregate([
-      {
-        $vectorSearch: {
-          index: "vector_index",
-          path: "embedding",
-          queryVector: queryEmbedding,
-          numCandidates: 50,
-          limit: topK,
-          filter: { userId: userId }
-        }
-      },
-      {
-        $project: {
-          message: 1,
-          response: 1,
-          score: { $meta: "vectorSearchScore" },
-          _id: 0
-        }
-      }
-    ]);
-
-    return results.map(r => ({
-      message: r.message,
-      response: r.response,
-      score: r.score
-    }));
-    
-  } catch (err) {
-    // If vector search fails (index not created), silently fall back
-    if (err.message?.includes('vector_index') || err.message?.includes('$vectorSearch')) {
-      console.warn("Vector search not available yet - index may not be created. Using MongoDB only.");
-    } else {
-      console.error("Vector search error:", err.message);
-    }
-    return [];
-  }
-}
-
-/**
- * ===============================
- * OPTIMIZED CONTEXT RETRIEVAL
+ * CONTEXT RETRIEVAL (TF-IDF METHOD)
  * ===============================
  */
 async function retrieveUserContext(userId, message) {
@@ -299,11 +102,34 @@ async function retrieveUserContext(userId, message) {
       ? conversationHistory[conversationHistory.length - 1].response
       : null;
 
-    // Get last 2 messages for recency
+    // Get last 2 messages for recency (optimized from 3)
     const recentHistory = conversationHistory.slice(-2);
 
-    // Get 2 most semantically relevant from vector search
-    const relevantHistory = await retrieveRelevantContext(userId, message, 2);
+    // TF-IDF for relevant history (optimized from 8 to 2)
+    let relevantHistory = [];
+    if (conversationHistory.length > 0) {
+      const tfidf = new TfIdf();
+      tfidf.addDocument(preprocessText(message));
+
+      const map = new Map();
+      conversationHistory.forEach((conv, idx) => {
+        if(conv.message && conv.message.length > 5) {
+          const combined = preprocessText(`${conv.message} ${conv.response || ''}`);
+          tfidf.addDocument(combined);
+          map.set(idx + 1, conv);
+        }
+      });
+
+      const scored = [];
+      tfidf.tfidfs(preprocessText(message), (i, score) => {
+        if (i > 0) scored.push({ conv: map.get(i), score });
+      });
+
+      relevantHistory = scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 2)
+        .map(v => v.conv);
+    }
 
     return {
       userInfo: {
@@ -335,7 +161,7 @@ async function retrieveUserContext(userId, message) {
  */
 async function updateUserContext(userId, username, message, response) {
   try {
-    const result = await UserContext.findOneAndUpdate(
+    await UserContext.findOneAndUpdate(
       { userId },
       {
         $set: { username, lastActive: new Date() },
@@ -350,15 +176,8 @@ async function updateUserContext(userId, username, message, response) {
           }
         }
       },
-      { upsert: true, new: true }
+      { upsert: true }
     );
-
-    const conversationId = result.conversationHistory.length;
-    
-    // Fire and forget - don't wait for vector storage
-    storeConversationVector(userId, message, response, conversationId)
-      .catch(err => console.error("Background vector storage failed:", err));
-
   } catch (e) {
     console.error("Context update failed", e);
   }
@@ -369,6 +188,15 @@ async function updateUserContext(userId, username, message, response) {
  * UTILITIES
  * ===============================
  */
+function preprocessText(text) {
+  if (!text) return '';
+  return tokenizer
+    .tokenize(text.toLowerCase())
+    .filter(t => t.length > 2)
+    .map(t => stemmer.stem(t))
+    .join(' ');
+}
+
 function removeAllEmojisAndEmoticons(text) {
   return text.replace(/[\u{1F600}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
 }
@@ -397,6 +225,7 @@ export const chatController = async (req, res) => {
 Rules: 1-2 sentences max. Never mention being AI. Use Hinglish if user does. No emojis.
 ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
 
+    // Combine relevant + recent context
     const seenMessages = new Set();
     const allContext = [...relevantHistory, ...recentHistory].filter(c => {
       const key = c.message?.substring(0, 50);
@@ -440,5 +269,3 @@ ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
     res.status(500).json({ error: "Chat failed" });
   }
 };
-
-export { ConversationVector };
