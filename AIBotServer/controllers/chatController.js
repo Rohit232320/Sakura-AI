@@ -102,10 +102,10 @@ async function retrieveUserContext(userId, message) {
       ? conversationHistory[conversationHistory.length - 1].response
       : null;
 
-    // Get last 2 messages for recency (optimized from 3)
+    // Get last 2 messages for recency
     const recentHistory = conversationHistory.slice(-2);
 
-    // TF-IDF for relevant history (optimized from 8 to 2)
+    // TF-IDF for relevant history
     let relevantHistory = [];
     if (conversationHistory.length > 0) {
       const tfidf = new TfIdf();
@@ -207,10 +207,29 @@ function removeAllEmojisAndEmoticons(text) {
  * ===============================
  */
 export const chatController = async (req, res) => {
-  const { message, userName } = req.body;
-  const userId = req.params.userId;
-
   try {
+    // Validate request body
+    if (!req.body) {
+      console.error("Request body is undefined - middleware issue");
+      return res.status(400).json({ 
+        error: "Request body is missing. Server configuration issue." 
+      });
+    }
+
+    const { message, userName } = req.body;
+    const userId = req.params.userId;
+
+    // Validate required fields
+    if (!message) {
+      console.error("Message is missing from request body");
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    if (!userId) {
+      console.error("UserId is missing from URL params");
+      return res.status(400).json({ error: "UserId is required" });
+    }
+
     const {
       userInfo,
       relevantHistory,
@@ -255,7 +274,7 @@ ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
     }
 
     if (!botResponse) {
-      botResponse = "Hmm.";
+      botResponse = "Sorry, I am having trouble responding right now. Please try again later.";
     }
 
     botResponse = removeAllEmojisAndEmoticons(botResponse.trim());
@@ -266,6 +285,9 @@ ${previousBotMessage ? `Last: "${previousBotMessage.substring(0, 80)}"` : ""}`;
 
   } catch (err) {
     console.error("chatController critical failure:", err);
-    res.status(500).json({ error: "Chat failed" });
+    res.status(500).json({ 
+      error: "Chat failed",
+      details: err.message 
+    });
   }
 };
